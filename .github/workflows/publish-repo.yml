@@ -1,0 +1,93 @@
+name: Build and publish Veyra package repository
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packages/**"
+      - ".github/workflows/publish-repo.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: veyra-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build Arch package and repository index
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p site/x86_64
+
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace:ro" \
+            -v "$GITHUB_WORKSPACE/site:/output" \
+            archlinux:latest \
+            bash -euxo pipefail -c '
+              pacman -Syu --noconfirm
+              pacman -S --needed --noconfirm \
+                base-devel git rust cargo
+
+              useradd --create-home builder
+              mkdir -p /tmp/veyra-build
+              cp -a /workspace/packages/veyra /tmp/veyra-build/veyra
+              chown -R builder:builder /tmp/veyra-build
+
+              su builder -s /bin/bash -c \
+                "cd /tmp/veyra-build/veyra && makepkg --cleanbuild --force --noconfirm"
+
+              cp /tmp/veyra-build/veyra/veyra-[0-9]*-x86_64.pkg.tar.zst \
+                /output/x86_64/
+
+              cd /output/x86_64
+              repo-add veyra.db.tar.gz veyra-[0-9]*-x86_64.pkg.tar.zst
+            '
+
+      - name: Create repository landing page
+        run: |
+          cat > site/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Veyra Packages</title>
+          </head>
+          <body>
+            <h1>Veyra Packages</h1>
+            <p>Experimental Arch Linux package repository for Veyra OS.</p>
+            <p>Architecture: x86_64</p>
+            <p>Repository metadata and packages are in the x86_64 directory.</p>
+            <p>Development repository: package signatures and trust configuration
+            are still being prepared. Do not configure this repository for
+            routine system-wide installation yet.</p>
+            <p><a href="https://github.com/abduali-kaz/VeyraPackages">
+            Source code on GitHub</a></p>
+          </body>
+          </html>
+          HTML
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy repository files to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
