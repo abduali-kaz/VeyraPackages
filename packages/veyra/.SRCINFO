@@ -1,7 +1,7 @@
 pkgbase = veyra
 	pkgdesc = Veyra OS system tools written in Rust
 	pkgver = 0.1.0
-	pkgrel = 1
+	pkgrel = 2
 	url = https://github.com/abduali-kaz/VeyraOS
 	arch = x86_64
 	license = custom
@@ -11,8 +11,10 @@ pkgbase = veyra
 	depends = sudo
 	depends = util-linux
 	depends = coreutils
+	depends = curl
+	depends = gnupg
 	options = !debug
-	source = veyra::git+https://github.com/abduali-kaz/VeyraOS.git#commit=4bb503f8ad5bda6af6096ce6fc046c99fd7ab44e
+	source = veyra::git+https://github.com/abduali-kaz/VeyraOS.git#commit=4dd5b8066f79145237208d89116352498a00ba9e
 	sha256sums = SKIP
 
 pkgname = veyra
