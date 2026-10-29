@@ -1,0 +1,10 @@
+/site/
+/dist/
+/packages/*/src/
+/packages/*/pkg/
+/packages/*/veyra/
+*.pkg.tar.*
+*.db
+*.db.tar.*
+*.sig
+*.log

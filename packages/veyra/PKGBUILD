@@ -1,0 +1,28 @@
+pkgname=veyra
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Veyra OS system tools written in Rust'
+arch=('x86_64')
+url='https://github.com/abduali-kaz/VeyraOS'
+license=('custom')
+options=('!debug')
+depends=('pacman' 'sudo' 'util-linux' 'coreutils')
+makedepends=('git' 'cargo')
+source=("veyra::git+https://github.com/abduali-kaz/VeyraOS.git#commit=4bb503f8ad5bda6af6096ce6fc046c99fd7ab44e")
+sha256sums=('SKIP')
+
+build() {
+    cd "$srcdir/veyra"
+    cargo build --release --locked
+}
+
+check() {
+    cd "$srcdir/veyra"
+    cargo fmt --check
+    cargo test --locked
+}
+
+package() {
+    install -Dm755 "$srcdir/veyra/target/release/veyra" \
+        "$pkgdir/usr/bin/veyra"
+}
