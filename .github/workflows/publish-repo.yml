@@ -5,13 +5,10 @@ on:
     branches: [main]
     paths:
       - "packages/**"
+      - "scripts/ci-build-package.sh"
+      - "keys/**"
       - ".github/workflows/publish-repo.yml"
   workflow_dispatch:
-
-permissions:
-  contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: veyra-pages
@@ -20,74 +17,147 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build Arch package and repository index
+      - name: Build unsigned package in Arch Linux
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p site/x86_64
+          mkdir -p "$GITHUB_WORKSPACE/package-output"
 
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/workspace:ro" \
-            -v "$GITHUB_WORKSPACE/site:/output" \
+            -v "$GITHUB_WORKSPACE/package-output:/output" \
             archlinux:latest \
-            bash -euxo pipefail -c '
-              pacman -Syu --noconfirm
-              pacman -S --needed --noconfirm \
-                base-devel git rust cargo
+            bash /workspace/scripts/ci-build-package.sh
 
-              useradd --create-home builder
-              mkdir -p /tmp/veyra-build
-              cp -a /workspace/packages/veyra /tmp/veyra-build/veyra
-              chown -R builder:builder /tmp/veyra-build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: veyra-package-unsigned
+          path: package-output/veyra-[0-9]*-x86_64.pkg.tar.zst
+          if-no-files-found: error
+          retention-days: 1
 
-              su builder -s /bin/bash -c \
-                "cd /tmp/veyra-build/veyra && makepkg --cleanbuild --force --noconfirm"
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
 
-              cp /tmp/veyra-build/veyra/veyra-[0-9]*-x86_64.pkg.tar.zst \
-                /output/x86_64/
+      - uses: actions/download-artifact@v4
+        with:
+          name: veyra-package-unsigned
+          path: site/x86_64
 
-              cd /output/x86_64
-              repo-add veyra.db.tar.gz veyra-[0-9]*-x86_64.pkg.tar.zst
-            '
-
-      - name: Create repository landing page
+      - name: Sign package and repository database
+        shell: bash
+        env:
+          VEYRA_SIGNING_KEY: ${{ secrets.VEYRA_SIGNING_KEY }}
+          VEYRA_SIGNING_PASSPHRASE: ${{ secrets.VEYRA_SIGNING_PASSPHRASE }}
+          VEYRA_SIGNING_FINGERPRINT: A2DDB00AAC95FABBB80E5123B8CBBAB063D237A2
         run: |
-          cat > site/index.html <<'HTML'
-          <!doctype html>
-          <html lang="en">
-          <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>Veyra Packages</title>
-          </head>
-          <body>
-            <h1>Veyra Packages</h1>
-            <p>Experimental Arch Linux package repository for Veyra OS.</p>
-            <p>Architecture: x86_64</p>
-            <p>Repository metadata and packages are in the x86_64 directory.</p>
-            <p>Development repository: package signatures and trust configuration
-            are still being prepared. Do not configure this repository for
-            routine system-wide installation yet.</p>
-            <p><a href="https://github.com/abduali-kaz/VeyraPackages">
-            Source code on GitHub</a></p>
-          </body>
-          </html>
-          HTML
+          set -euo pipefail
+
+          export GNUPGHOME="$RUNNER_TEMP/veyra-gnupg"
+          KEY_FILE="$RUNNER_TEMP/veyra-signing.asc"
+          PASS_FILE="$RUNNER_TEMP/veyra-passphrase"
+
+          cleanup() {
+            rm -f "$KEY_FILE" "$PASS_FILE"
+            gpgconf --kill gpg-agent >/dev/null 2>&1 || true
+            rm -rf "$GNUPGHOME"
+          }
+          trap cleanup EXIT
+
+          install -d -m 700 "$GNUPGHOME"
+          printf '%s' "$VEYRA_SIGNING_KEY" > "$KEY_FILE"
+          printf '%s' "$VEYRA_SIGNING_PASSPHRASE" > "$PASS_FILE"
+          chmod 600 "$KEY_FILE" "$PASS_FILE"
+          unset VEYRA_SIGNING_KEY VEYRA_SIGNING_PASSPHRASE
+
+          gpg --batch --import "$KEY_FILE"
+
+          PACKAGE="$(find site/x86_64 -maxdepth 1 -type f \
+            -name 'veyra-[0-9]*-x86_64.pkg.tar.zst' -print -quit)"
+          test -n "$PACKAGE"
+
+          gpg --batch --yes --no-tty --pinentry-mode loopback \
+            --passphrase-file "$PASS_FILE" \
+            --local-user "$VEYRA_SIGNING_FINGERPRINT" \
+            --digest-algo SHA256 \
+            --detach-sign --output "$PACKAGE.sig" "$PACKAGE"
+
+          # repo-add embeds the matching package signature in its database.
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/site/x86_64:/repo" \
+            archlinux:latest \
+            bash -euc \
+            'command -v repo-add; cd /repo; repo-add --include-sigs veyra.db.tar.gz ./*.pkg.tar.zst'
+
+          DB="site/x86_64/veyra.db.tar.gz"
+          test -s "$DB"
+
+          gpg --batch --yes --no-tty --pinentry-mode loopback \
+            --passphrase-file "$PASS_FILE" \
+            --local-user "$VEYRA_SIGNING_FINGERPRINT" \
+            --digest-algo SHA256 \
+            --detach-sign --output "$DB.sig" "$DB"
+
+          # Publish ordinary files for both common database URL names.
+          cp --remove-destination "$DB" site/x86_64/veyra.db
+          cp --remove-destination "$DB.sig" site/x86_64/veyra.db.sig
+
+          # Remove an optional file-list index; pacman doesn't need it.
+          rm -f site/x86_64/veyra.files*
+
+          # Verify both signatures before publishing.
+          gpg --batch --verify "$PACKAGE.sig" "$PACKAGE"
+          gpg --batch --verify "$DB.sig" "$DB"
+
+          printf '\n=== SIGNED FILES ===\n'
+          find site/x86_64 -maxdepth 1 -type f -printf '%f (%s bytes)\n' | sort
+
+      - name: Prepare repository website
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p site/keys
+          cp keys/veyra-packages.asc site/keys/
+
+          printf '%s\n' \
+            '<!doctype html>' \
+            '<html lang="en">' \
+            '<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Veyra Packages</title></head>' \
+            '<body>' \
+            '<h1>Veyra Packages</h1>' \
+            '<p>Experimental Arch Linux package repository for Veyra OS.</p>' \
+            '<p>Architecture: x86_64.</p>' \
+            '<p>Package and repository database signatures are generated by GitHub Actions.</p>' \
+            '<p>Public signing key: <a href="keys/veyra-packages.asc">veyra-packages.asc</a></p>' \
+            '<p>Do not configure system-wide installation until the key fingerprint has been independently verified and trusted.</p>' \
+            '<p><a href="https://github.com/abduali-kaz/VeyraPackages">Source code</a></p>' \
+            '</body></html>' \
+            > site/index.html
 
       - uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
   deploy:
-    needs: build
+    needs: publish
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Deploy repository files to GitHub Pages
+      - name: Deploy signed repository
         id: deployment
         uses: actions/deploy-pages@v5
